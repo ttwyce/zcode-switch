@@ -1015,6 +1015,10 @@ listen("oauth://done", (ev) => {
     return;
   }
   toast(t("m.oauthOk", { name: p.name }), "ok", t("m.oauthOkDetail"));
+  if (p.warning) {
+    // 业务令牌换取失败但已降级入库（JWT 主凭据不受影响）：明确告知而非静默
+    toast(t("m.oauthBizWarn", { err: p.warning }), "warn");
+  }
   refresh().then(() => { if (!uiLocked()) { render(); enrollAccounts(); } }).catch(() => {});
 });
 

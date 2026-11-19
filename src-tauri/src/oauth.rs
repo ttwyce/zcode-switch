@@ -591,19 +591,57 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Opti
     Some(format!("{key}.{}", secret.trim()))
 }
 
-pub fn resolve_zai_business_token(zai_access_token: &str) -> Option<String> {
+pub fn resolve_zai_business_token(zai_access_token: &str) -> Result<String, String> {
     resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token)
 }
 
-fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Option<String> {
-    let resp = web_agent()
+fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Result<String, String> {
+    // api.z.ai 线路时通时断（2026-11-20 实测同一窗口先 15s 超时、紧接一次即通），
+    // 单发即败会把整个登录判死：传输类失败短重试 3 次；上游业务码明确拒绝
+    // （token 无效等）重试无意义，立即失败并带归因。
+    let mut last_err = String::from("未知错误");
+    for attempt in 1..=3 {
+        if attempt > 1 {
+            std::thread::sleep(Duration::from_millis(1200 * (attempt as u64 - 1)));
+        }
+        match zai_business_token_once(url, zai_access_token) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                let retryable = e.starts_with("网络错误") || e.starts_with("HTTP");
+                last_err = format!("[{attempt}/3] {e}");
+                if !retryable {
+                    return Err(last_err);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn zai_business_token_once(url: &str, zai_access_token: &str) -> Result<String, String> {
+    let mut resp = web_agent()
         .post(url)
         .set("Content-Type", "application/json")
         .send_json(json!({ "token": zai_access_token }))
-        .ok()?
+        .map_err(|e| format!("网络错误: {e}"))?;
+    let status = resp.status();
+    let body = resp
         .into_string()
-        .ok()?;
-    let v: Value = serde_json::from_str(&resp).ok()?;
+        .map_err(|_| format!("HTTP {status} 响应读取失败"))?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| {
+        format!(
+            "HTTP {status} 非 JSON 响应: {}",
+            body.chars().take(120).collect::<String>()
+        )
+    })?;
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
+    if code != 0 {
+        let msg = ["msg", "message"]
+            .iter()
+            .find_map(|k| v.get(k).and_then(|x| x.as_str()))
+            .unwrap_or("");
+        return Err(format!("上游拒绝 code={code} {msg}"));
+    }
     ["access_token", "accessToken"]
         .iter()
         .find_map(|k| {
@@ -613,6 +651,7 @@ fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Option<St
                 .filter(|s| !s.is_empty())
                 .map(String::from)
         })
+        .ok_or_else(|| "响应缺少业务令牌字段".to_string())
 }
 
 pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {

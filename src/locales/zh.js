@@ -95,6 +95,7 @@ export const zh = {
   "m.oauthDupDetail": "同一账号无需重复添加；要换号请先在登录页退出登录",
   "m.oauthOk": "已添加「{name}」",
   "m.oauthOkDetail": "不影响当前登录；需要时在列表里切换",
+  "m.oauthBizWarn": "z.ai 业务令牌暂未换取，账号已正常入库（额度回退通道暂缺）：{err}",
   "m.emptyTitle": "账号库为空",
   "m.emptyBody": "先用下方 <b>保存当前登录</b> 存入第一个账号，或<b>导入</b>账号文件",
   "m.saveLoginDisabledTitle": "当前登录已是存档「{name}」，无需重复保存",

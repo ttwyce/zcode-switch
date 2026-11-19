@@ -638,8 +638,19 @@ fn persist_oauth_account(
         .ok_or_else(|| i18n::tr("err.oauth.no_token"))?
         .to_string();
     let raw_access = oauth::extract_access_token(provider, raw).unwrap_or_default();
+    // 业务令牌只是额度查询的候选回退凭据（JWT 才是主凭据）：api.z.ai 线路抖动
+    // 不该卡死整个登录（2026-11-20 实测同时段先超时后即通）。换取失败 → 降级
+    // 继续入库，原因记入 flowlog 并随 oauth://done 上抛由前端提示。
+    let mut biz_token_warning: Option<String> = None;
     let access_token = if provider == "zai" && !raw_access.is_empty() {
-        oauth::resolve_zai_business_token(&raw_access).ok_or_else(|| i18n::tr("err.oauth.zai_business"))?
+        match oauth::resolve_zai_business_token(&raw_access) {
+            Ok(t) => t,
+            Err(e) => {
+                flowlog::log(&flow, "biz-token-degraded", &e);
+                biz_token_warning = Some(e);
+                String::new()
+            }
+        }
     } else {
         raw_access
     };
@@ -683,7 +694,11 @@ fn persist_oauth_account(
         }
         save_account(paths, &dup)?;
         *pending_oauth_guard() = None;
-        return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
+        let mut out = json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true });
+        if let Some(w) = biz_token_warning {
+            out["warning"] = json!(w);
+        }
+        return Ok(out);
     }
     let base = credentials
         .get(format!("oauth:{provider}:user_info"))
@@ -712,7 +727,11 @@ fn persist_oauth_account(
     }
     save_account(paths, &acc)?;
     *pending_oauth_guard() = None;
-    Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
+    let mut out = json!({ "id": acc.id, "name": acc.name, "provider": provider });
+    if let Some(w) = biz_token_warning {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
 
 fn finalize_oauth_result(app: &AppHandle, result: Result<serde_json::Value, String>) {

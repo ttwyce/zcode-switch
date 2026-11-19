@@ -95,6 +95,7 @@ export const en = {
   "m.oauthDupDetail": "No need to add the same account twice; to change accounts, sign out on the login page first",
   "m.oauthOk": "Added \"{name}\"",
   "m.oauthOkDetail": "Current login untouched — switch from the list whenever you need",
+  "m.oauthBizWarn": "z.ai business token not resolved — account saved normally (quota fallback unavailable for now): {err}",
   "m.emptyTitle": "Account store is empty",
   "m.emptyBody": "Use <b>Save current login</b> below to store your first account, or <b>import</b> account files",
   "m.saveLoginDisabledTitle": "Current login is already saved as \"{name}\"",
