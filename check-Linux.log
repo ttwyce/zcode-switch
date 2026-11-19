@@ -1,0 +1,25 @@
+[1m[92m    Updating[0m crates.io index
+[1m[92m   Compiling[0m zcode-switch v1.7.0-beta.1 (/home/runner/work/zcode-switch/zcode-switch/src-tauri)
+[1m[91merror[E0004][0m[1m: non-exhaustive patterns: `&quota::Channel::ZaiCoding(_)` not covered[0m
+   [1m[94m--> [0msrc/probe.rs:191:29
+    [1m[94m|[0m
+[1m[94m191[0m [1m[94m|[0m         let verdict = match ch {
+    [1m[94m|[0m                             [1m[91m^^[0m [1m[91mpattern `&quota::Channel::ZaiCoding(_)` not covered[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `quota::Channel` defined here
+   [1m[94m--> [0msrc/quota.rs:550:17
+    [1m[94m|[0m
+[1m[94m550[0m [1m[94m|[0m pub(crate) enum Channel {
+    [1m[94m|[0m                 [1m[92m^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m553[0m [1m[94m|[0m     ZaiCoding(String),
+    [1m[94m|[0m     [1m[94m---------[0m [1m[94mnot covered[0m
+    [1m[94m= [0m[1mnote[0m: the matched value is of type `&quota::Channel`
+[1m[96mhelp[0m: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+    [1m[94m|[0m
+[1m[94m196[0m [92m~ [0m            }[92m,[0m
+[1m[94m197[0m [92m+             &quota::Channel::ZaiCoding(_) => todo!()[0m
+    [1m[94m|[0m
+
+[1mFor more information about this error, try `rustc --explain E0004`.[0m
+[1m[91merror[0m: could not compile `zcode-switch` (lib test) due to 1 previous error
