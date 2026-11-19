@@ -592,15 +592,25 @@ pub fn resolve_biz_api_key(base: &str, auth: &str, require_secret: bool) -> Opti
 }
 
 pub fn resolve_zai_business_token(zai_access_token: &str) -> Result<String, String> {
-    resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token)
+    resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token, 3)
 }
 
-fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Result<String, String> {
+/// 单发版：切换等同步路径专用——api.z.ai 抖动时不阻塞主流程，失败即回落旧值。
+pub fn resolve_zai_business_token_once(zai_access_token: &str) -> Result<String, String> {
+    resolve_zai_business_token_at(ZAI_BUSINESS_LOGIN_URL, zai_access_token, 1)
+}
+
+fn resolve_zai_business_token_at(
+    url: &str,
+    zai_access_token: &str,
+    attempts: usize,
+) -> Result<String, String> {
     // api.z.ai 线路时通时断（2026-11-20 实测同一窗口先 15s 超时、紧接一次即通），
-    // 单发即败会把整个登录判死：传输类失败短重试 3 次；上游业务码明确拒绝
-    // （token 无效等）重试无意义，立即失败并带归因。
+    // 单发即败会把整个登录判死：传输类失败短重试（缺省 3 次）；上游业务码明确
+    // 拒绝（token 无效等）重试无意义，立即失败并带归因。
+    let attempts = attempts.max(1);
     let mut last_err = String::from("未知错误");
-    for attempt in 1..=3 {
+    for attempt in 1..=attempts {
         if attempt > 1 {
             std::thread::sleep(Duration::from_millis(1200 * (attempt as u64 - 1)));
         }
@@ -608,7 +618,7 @@ fn resolve_zai_business_token_at(url: &str, zai_access_token: &str) -> Result<St
             Ok(t) => return Ok(t),
             Err(e) => {
                 let retryable = e.starts_with("网络错误") || e.starts_with("HTTP");
-                last_err = format!("[{attempt}/3] {e}");
+                last_err = format!("[{attempt}/{attempts}] {e}");
                 if !retryable {
                     return Err(last_err);
                 }

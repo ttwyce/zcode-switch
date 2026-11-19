@@ -772,7 +772,8 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
         (false, None) => String::new(),
     };
     let access_token = if provider == "zai" && !access_token.is_empty() {
-        crate::oauth::resolve_zai_business_token(&access_token).unwrap_or(access_token)
+        // switch_to 同步路径：单发不重试，api.z.ai 抖动时不阻塞切换（失败回落旧值）
+        crate::oauth::resolve_zai_business_token_once(&access_token).unwrap_or(access_token)
     } else {
         access_token
     };
