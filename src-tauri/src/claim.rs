@@ -449,6 +449,7 @@ pub fn submit_claim(
     if captcha_param.trim().is_empty() {
         return Err(crate::i18n::tr("err.claim.no_captcha").into());
     }
+    let tag = crate::claimlog::mid_tag(device_mid.as_deref());
     let secret = zcrypto::default_secret(home);
     let token = claim_token(creds, config, &secret)?;
     let mut req = agent().post(BILLING_CLAIM_URL);
@@ -473,7 +474,6 @@ pub fn submit_claim(
             next_at: None,
         })?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
-    let tag = crate::claimlog::mid_tag(device_mid.as_deref());
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
         let err = claim_error(code, &v);

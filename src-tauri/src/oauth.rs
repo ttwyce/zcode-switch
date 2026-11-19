@@ -629,7 +629,7 @@ fn resolve_zai_business_token_at(
 }
 
 fn zai_business_token_once(url: &str, zai_access_token: &str) -> Result<String, String> {
-    let mut resp = web_agent()
+    let resp = web_agent()
         .post(url)
         .set("Content-Type", "application/json")
         .send_json(json!({ "token": zai_access_token }))
