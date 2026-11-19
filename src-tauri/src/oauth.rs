@@ -617,7 +617,11 @@ fn resolve_zai_business_token_at(
         match zai_business_token_once(url, zai_access_token) {
             Ok(t) => return Ok(t),
             Err(e) => {
-                let retryable = e.starts_with("网络错误") || e.starts_with("HTTP");
+                // 可重试 = 传输类（网络/超时）或服务端瞬态（429/5xx）；
+                // HTTP 4xx / 上游明确拒绝不重试
+                let retryable = e.starts_with("网络错误")
+                    || e.starts_with("HTTP 429")
+                    || e.starts_with("HTTP 5");
                 last_err = format!("[{attempt}/{attempts}] {e}");
                 if !retryable {
                     return Err(last_err);
@@ -629,11 +633,30 @@ fn resolve_zai_business_token_at(
 }
 
 fn zai_business_token_once(url: &str, zai_access_token: &str) -> Result<String, String> {
-    let resp = web_agent()
+    // api.z.ai /api/auth/z/login 成功形态：HTTP 200 + {"code":200,"msg":
+    // "Operation successful","data":{"access_token":...}}——业务码是 HTTP 风格
+    // （200 成功 / 500 token 无效），与 zcode.z.ai 家族 code=0 约定不同。
+    // 对齐 zcode2api exchange_api_key 口径：不校验 code，只认 /data/access_token。
+    let resp = match web_agent()
         .post(url)
         .set("Content-Type", "application/json")
         .send_json(json!({ "token": zai_access_token }))
-        .map_err(|e| format!("网络错误: {e}"))?;
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            let msg = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    ["msg", "message"]
+                        .iter()
+                        .find_map(|k| v.get(k).and_then(|x| x.as_str()).map(String::from))
+                })
+                .unwrap_or_default();
+            return Err(format!("HTTP {code} {msg}"));
+        }
+        Err(e) => return Err(format!("网络错误: {e}")),
+    };
     let status = resp.status();
     let body = resp
         .into_string()
@@ -644,24 +667,21 @@ fn zai_business_token_once(url: &str, zai_access_token: &str) -> Result<String, 
             body.chars().take(120).collect::<String>()
         )
     })?;
-    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-    if code != 0 {
-        let msg = ["msg", "message"]
-            .iter()
-            .find_map(|k| v.get(k).and_then(|x| x.as_str()))
-            .unwrap_or("");
-        return Err(format!("上游拒绝 code={code} {msg}"));
+    if let Some(tok) = ["access_token", "accessToken"].iter().find_map(|k| {
+        v.pointer(&format!("/data/{k}"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }) {
+        return Ok(tok);
     }
-    ["access_token", "accessToken"]
+    let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+    let msg = ["msg", "message"]
         .iter()
-        .find_map(|k| {
-            v.pointer(&format!("/data/{k}"))
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-        })
-        .ok_or_else(|| "响应缺少业务令牌字段".to_string())
+        .find_map(|k| v.get(k).and_then(|x| x.as_str()))
+        .unwrap_or("");
+    Err(format!("上游拒绝 code={code} {msg}"))
 }
 
 pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {

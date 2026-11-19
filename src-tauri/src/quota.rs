@@ -20,6 +20,9 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
+// Coding 平面第二账本（对齐 zcode2api fetch_coding_limits）：体验套餐号在
+// billing 侧常全空/全拒，这里能给出真实上限表——裸 authorization: <apikey>。
+pub const CODING_LIMIT_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 pub const CLIENT_APP_VERSION: &str = "3.11.2";
 
 pub(crate) fn client_platform() -> String {
@@ -384,6 +387,12 @@ fn http_get_json(url: &str, token: &str, retry_429: bool) -> Result<Value, Strin
         .build();
     let headers = if url.contains("zcode.z.ai") {
         zai_billing_headers(token)
+    } else if url.contains("api.z.ai") {
+        // Coding 平面 monitor 端点：裸 authorization（无 Bearer，也不是 JWT）
+        vec![
+            ("authorization".to_string(), token.to_string()),
+            ("accept".to_string(), "application/json".to_string()),
+        ]
     } else {
         bigmodel_headers(token)
     };
@@ -541,6 +550,7 @@ pub fn query_quota(tokens: &[String]) -> Result<QuotaOverview, String> {
 pub(crate) enum Channel {
     Monitor(String),
     ZaiBilling(String),
+    ZaiCoding(String),
 }
 
 pub(crate) fn is_no_plan_message(msg: &str) -> bool {
@@ -653,7 +663,67 @@ pub(crate) fn pick_channels(creds: &Value, config: Option<&Value>, secret: &str,
             }
         }
     }
+    // Coding 平面第二账本：业务令牌（oauth:zai:access_token）在库时启用，
+    // 体验套餐号 billing 全空时由它补盲；只读、不影响账号状态判定。
+    if let Some(at) = safe_decrypt(
+        creds.get("oauth:zai:access_token").and_then(|v| v.as_str()),
+        secret,
+    ) {
+        let at = at.trim().to_string();
+        if !at.is_empty() && !chans.contains(&Channel::ZaiCoding(at.clone())) {
+            chans.push(Channel::ZaiCoding(at));
+        }
+    }
     chans
+}
+
+/// api.z.ai monitor limits → QuotaOverview（对齐 zcode2api _normalize_limits）。
+/// data.limits[] 混排 TOKENS_LIMIT / TIME_LIMIT 两类窗口：
+/// {type, unit, number, usage, remaining, percentage, next_reset_time}。
+fn normalize_coding_limits(limits: &[Value]) -> QuotaOverview {
+    let items: Vec<QuotaItem> = limits
+        .iter()
+        .filter_map(|it| {
+            let name = it.get("type").and_then(|x| x.as_str())?.trim().to_string();
+            let num = |k: &str| it.get(k).and_then(|x| x.as_f64());
+            let unit = match it.get("unit") {
+                Some(Value::String(s)) => s.clone(),
+                Some(x) => x.to_string(),
+                None => String::new(),
+            };
+            Some(QuotaItem {
+                name: name.trim_end_matches("_LIMIT").to_string(),
+                total: num("number"),
+                used: num("usage"),
+                remaining: num("remaining"),
+                percent_used: num("percentage"),
+                unit: if unit.contains("oken") { "token".into() } else { unit },
+                period_end: it
+                    .get("next_reset_time")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
+                ..Default::default()
+            })
+        })
+        .collect();
+    let has_content = items.iter().any(|i| i.total.is_some() || i.remaining.is_some());
+    let slot = PlanSlot {
+        pid: "coding".into(),
+        name: Some("Coding".into()),
+        total: items.iter().find_map(|i| i.total),
+        used: items.iter().find_map(|i| i.used),
+        remaining: items.iter().find_map(|i| i.remaining),
+        percent_used: items.iter().find_map(|i| i.percent_used),
+        items: items.clone(),
+        ..Default::default()
+    };
+    QuotaOverview {
+        is_empty: !has_content,
+        items,
+        plans: vec![slot],
+        source: "api.z.ai/monitor".into(),
+        ..Default::default()
+    }
 }
 
 fn no_plan_overview() -> QuotaOverview {
@@ -720,6 +790,53 @@ fn query_channels_via(channels: &[Channel], fetch: &FetchFn) -> Result<QuotaOver
                                 .unwrap_or_default();
                             let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
                             best_err = Some(crate::i18n::trf("err.quota.biz", &[("code", &code.to_string()), ("msg", &msg)]));
+                        }
+                    }
+                    Err(e) => {
+                        if best_err.is_none() {
+                            best_err = Some(e);
+                        }
+                    }
+                }
+            }
+            Channel::ZaiCoding(key) => {
+                // billing 已有套餐就不补盲：api.z.ai 线路慢（实测 5s+），
+                // 省一次每次刷新都白打的往返
+                let billing_has_plan = parts.iter().any(|p| {
+                    p.plan_tier.is_some() || p.plans.iter().any(|s| !s.items.is_empty())
+                });
+                if billing_has_plan {
+                    continue;
+                }
+                match fetch(CODING_LIMIT_URL, key) {
+                    Ok(resp) => {
+                        let limits = resp
+                            .pointer("/data/limits")
+                            .and_then(|l| l.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        if !limits.is_empty() {
+                            let mut ov = normalize_coding_limits(&limits);
+                            ov.refreshed_at = chrono::Local::now().timestamp_millis();
+                            parts.push(ov);
+                        } else if best_err.is_none() {
+                            // limits 空或结构不符：上游带业务错误则归因，否则按
+                            // 无数据（不报错，让其他通道说话）
+                            let code = resp.get("code").and_then(|c| c.as_i64());
+                            let msg = ["msg", "message"]
+                                .iter()
+                                .find_map(|k| {
+                                    resp.get(k).and_then(|x| x.as_str()).map(String::from)
+                                })
+                                .unwrap_or_default();
+                            if let Some(c) = code.filter(|c| *c != 200 && *c != 0) {
+                                best_err = Some(crate::i18n::trf(
+                                    "err.quota.biz",
+                                    &[("code", &c.to_string()), ("msg", &msg)],
+                                ));
+                            } else {
+                                saw_no_plan = true;
+                            }
                         }
                     }
                     Err(e) => {
