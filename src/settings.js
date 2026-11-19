@@ -141,6 +141,16 @@ const actions = {
         state.auth_proxy_on ? t("s.proxySavedOn") : t("s.proxySavedOff"));
     });
   },
+
+  async saveClaimWindow() {
+    const input = document.querySelector(".settings input.claim-window");
+    if (!input) return;
+    await guard(async () => {
+      await invoke("set_behavior", { claimWindow: input.value.trim() });
+      await refresh(); render();
+      toast(t("s.claimWindowSaved"), "ok", t("s.claimWindowSavedDetail"));
+    });
+  },
 };
 
 const toggle = (on, onclickAttr, label, desc) => `
@@ -178,6 +188,12 @@ function render() {
       ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
       ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
+      <div class="path-line" style="margin-top:6px">
+        <input class="zcode-path claim-window" type="text" value="${esc(s.claim_window || "")}"
+          placeholder="${t("s.claimWindowPh")}" keydown="onClaimWindowKey(event)">
+        <button class="btn-ghost" click="actions.saveClaimWindow()">${t("common.save")}</button>
+      </div>
+      <div class="hint">${t("s.claimWindowHint")}</div>
       <label style="margin-top:14px">${t("s.authLabel")}</label>
       ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
       <div class="path-line" style="margin-top:6px">
@@ -204,6 +220,7 @@ function render() {
 window.actions = actions;
 window.onPathKey = (e) => { if (e.key === "Enter") actions.savePath(); };
 window.onProxyKey = (e) => { if (e.key === "Enter") actions.saveProxy(); };
+window.onClaimWindowKey = (e) => { if (e.key === "Enter") actions.saveClaimWindow(); };
 installDelegation();
 
 listen("state-changed", () => {

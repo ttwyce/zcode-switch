@@ -127,6 +127,9 @@ pub struct Account {
     pub virtual_arms_uid: Option<String>,
 }
 
+/// 自动领取窗口缺省值：北京 19 点档（上游活动套餐每天 19:00 放量的实证口径）。
+const DEFAULT_CLAIM_WINDOW: &str = "19";
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Settings {
     pub zcode_path: Option<String>,
@@ -142,6 +145,8 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    #[serde(default)]
+    pub claim_window: Option<String>,
 }
 
 impl Settings {
@@ -149,6 +154,14 @@ impl Settings {
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    /// 自动领取窗口（北京时间小时描述，如 "19" / "19-21" / "19,21"；
+    /// 空 = 全天不限时）。默认 19 点档——上游活动套餐按天投放，每天 19:00
+    /// 放量（zcode2api 线上实证），窗口外自动链路不做任何上游探测。
+    pub fn claim_window(&self) -> String {
+        self.claim_window
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLAIM_WINDOW.to_string())
+    }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -187,6 +200,7 @@ pub struct AppState {
     pub close_to_tray: bool,
     pub hot_switch: bool,
     pub auto_claim: bool,
+    pub claim_window: String,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -1518,6 +1532,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         close_to_tray: settings.close_to_tray(),
         hot_switch: settings.hot_switch(),
         auto_claim: settings.auto_claim(),
+        claim_window: settings.claim_window(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

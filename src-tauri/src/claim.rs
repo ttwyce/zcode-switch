@@ -3,12 +3,19 @@ use crate::quota;
 use crate::zcrypto;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
+// 营销触达 / 活动投放端点（官方客户端逆向实证）：活动套餐（如每晚 19 点放量的
+// 大额 token 包，plan_id 形如 zcode-v3-start-plan-MMDD）由此下发，不进
+// billing/preview。deliveries[].banner 内含 action.type="claim_zcode_plan"
+// 与 args.zcode_plan 完整套餐载荷。
+const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
@@ -184,7 +191,37 @@ fn device_os_category() -> &'static str {
     }
 }
 
-pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), String> {
+/// 激活上报每日去重门：device_mid → 最近一次**成功**上报的北京日期序号。
+/// 官方节奏 = app_daily_active 每号每天 1 次（上游按 device_mid+日期去重，
+/// 自动轮次每 60s 重发纯属浪费请求且添指纹噪音）。上报失败不记账，下轮
+/// 自然重试；手动刷新 force=true 不走此门（用户触发 = 必发，zcode2api 口径）。
+static ACTIVATION_REPORTED: std::sync::OnceLock<Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+/// 北京时间（UTC+8，中国无夏令时）当日序号：只用于同日比较，无需 Y-M-D 格式。
+fn beijing_day_index() -> i64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + 8 * 3600;
+    secs.div_euclid(86_400)
+}
+
+pub fn report_activation_events(user_id: &str, device_mid: &str, force: bool) -> Result<(), String> {
+    if !force {
+        let today = beijing_day_index().to_string();
+        let table = ACTIVATION_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
+        let hit = table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(device_mid)
+            .map(String::as_str)
+            == Some(today.as_str());
+        if hit {
+            return Ok(());
+        }
+    }
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(ACTIVATION_TIMEOUT_SECS))
@@ -211,6 +248,15 @@ pub fn report_activation_events(user_id: &str, device_mid: &str) -> Result<(), S
             return Err(failure_message(code, &v));
         }
     }
+    // 上报成功才记账（失败不记，下轮自然重试）
+    if !force {
+        let today = beijing_day_index().to_string();
+        let table = ACTIVATION_REPORTED.get_or_init(|| Mutex::new(HashMap::new()));
+        table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(device_mid.to_string(), today);
+    }
     Ok(())
 }
 
@@ -227,7 +273,113 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    preview_once(&url, &token, device_mid)
+    let mut out = preview_once(&url, &token, device_mid.clone())?;
+    // 合并 marketing/touch 活动投放通道（官方客户端实证：活动套餐由此下发，
+    // 不进 billing/preview）。失败只跳过合并，不让整个 preview 报错。
+    let marketing = fetch_marketing_touch_plans(&token, device_mid);
+    if !marketing.is_empty() {
+        // 用 owned String 建去重集：借 out 的 &str 再 push 会撞借用检查
+        let seen: std::collections::HashSet<String> =
+            out.iter().map(|p| p.plan_id.clone()).collect();
+        for mp in marketing {
+            if !seen.contains(&mp.plan_id) {
+                out.push(mp);
+            }
+        }
+        out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    }
+    Ok(out)
+}
+
+fn fetch_marketing_touch_plans(token: &str, mid: Option<String>) -> Vec<ClaimPlan> {
+    let mut req = agent().get(&format!("{MARKETING_TOUCH_URL}?seq=0"));
+    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[claim] marketing/touch 查询跳过: {}", http_err("", e).trim());
+            return Vec::new();
+        }
+    };
+    let body = match resp.into_string() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[claim] marketing/touch 响应读取失败: {e}");
+            return Vec::new();
+        }
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        return Vec::new();
+    }
+    let deliveries = v
+        .pointer("/data/deliveries")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    extract_plans_from_deliveries(&deliveries)
+}
+
+/// 从 marketing/touch 的 deliveries 载荷递归提取待领取套餐。
+/// 官方客户端结构实证：delivery.banner.buttons[].action 为
+/// `{"type":"claim_zcode_plan","args":{"plan_id":...}}`；
+/// delivery.banner.args.zcode_plan 为完整套餐对象。
+/// ① `zcode_plan`/`zcodePlan` 对象走 parse_plan（后到者更新先到的占位项）；
+/// ② 仅命中按钮动作时按 plan_id 生成占位套餐（priority 100 抢先领取）。
+fn extract_plans_from_deliveries(deliveries: &[Value]) -> Vec<ClaimPlan> {
+    fn scan(v: &Value, out: &mut Vec<ClaimPlan>) {
+        match v {
+            Value::Array(items) => {
+                for it in items {
+                    scan(it, out);
+                }
+            }
+            Value::Object(map) => {
+                let zp = map.get("zcode_plan").or_else(|| map.get("zcodePlan"));
+                if let Some(parsed) = zp.and_then(parse_plan) {
+                    match out.iter_mut().find(|p| p.plan_id == parsed.plan_id) {
+                        Some(existing) => *existing = parsed,
+                        None => out.push(parsed),
+                    }
+                }
+                let action = map.get("action").filter(|a| a.is_object());
+                if let Some(a) = action {
+                    let atype = a.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if atype == "claim_zcode_plan" {
+                        let pid = a
+                            .pointer("/args/plan_id")
+                            .or_else(|| a.pointer("/args/planId"))
+                            .and_then(|p| p.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        if let Some(pid) = pid {
+                            if !out.iter().any(|p| p.plan_id == pid) {
+                                out.push(ClaimPlan {
+                                    plan_id: pid.to_string(),
+                                    name: pid.to_string(),
+                                    description: String::new(),
+                                    priority: 100,
+                                    grants: Vec::new(),
+                                    grant_items: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+                for val in map.values() {
+                    scan(val, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for d in deliveries {
+        scan(d, &mut out);
+    }
+    out
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {
@@ -328,9 +480,16 @@ pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
     }
     let c = v.pointer("/data/configs/captcha").cloned().unwrap_or(Value::Null);
     let s = |k: &str| c.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let mut region = s("region");
+    // sgp 归一为 cn（zcode2api 2.7.58/2.7.59 实证）：上游按出口 IP 下发 region
+    // （美区出口实测 sgp），但 sgp 端点无痕验证稳定必败；且 region 头必须与
+    // 签发端点一致，错位 = 上游验签必败 3007。
+    if region.eq_ignore_ascii_case("sgp") {
+        region = "cn".to_string();
+    }
     Ok(CaptchaConfig {
         enabled: c.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
-        region: s("region"),
+        region,
         prefix: s("prefix"),
         scene_id: s("sceneId"),
     })
@@ -430,6 +589,7 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         1004 => "claim.fail.1004",
         1005 => "claim.fail.1005",
         3001 => "claim.fail.3001",
+        3002 => "claim.fail.3002",
         3007 => "claim.fail.3007",
         401 => "claim.fail.401",
         _ => "claim.fail.generic",

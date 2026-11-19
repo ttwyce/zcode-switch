@@ -22,12 +22,18 @@ const AUTO_CLAIM_WAIT_MS = 45_000;
 const AUTO_CLAIM_PER_ACCOUNT_CAP = 5;
 const AUTO_CLAIM_ACCT_GAP_MS = 5_000;
 const AUTO_ABORT_WAIT_MS = 90_000;
+// 领取窗口（北京时间）：上游活动套餐按天投放，每天 19:00 放量即领
+// （zcode2api 线上实证）。窗口内 60s 节拍；窗口外不向上游发任何领取链请求
+// （防风控），只安排到下个窗口起点的准点唤醒 + 低频回看设置改动。
+const AUTO_CLAIM_WINDOW_BEAT_MS = 60 * 1000;
+const AUTO_CLAIM_IDLE_LOOK_MS = 30 * 60 * 1000;
 let autoClaimRunning = false;
 let autoClaimCooldown = {};
 let autoAbortRequested = false;
 let claimActive = false;
 let lastAutoRound = null;
 let autoToggleBusy = false;
+let autoClaimTimer = null;
 
 const NOTCH_COLORS = ["var(--notch-1)", "var(--notch-2)", "var(--notch-3)", "var(--notch-4)", "var(--notch-5)", "var(--notch-6)"];
 function notchColor(id) {
@@ -123,8 +129,80 @@ async function awaitClaimPreviewFresh(id) {
 
 const accountName = (id) => (state?.accounts || []).find((a) => a.id === id)?.name || id;
 
+// ── 领取窗口（北京时间小时）───────────────────────────────────────────────
+// 锚定北京时钟而非本机时区（UTC+8 固定偏移，中国无夏令时，与 zcode2api 口径
+// 一致）；空/“*” = 全天不限时。写错配置不允许静默升级成全天——回落默认 19 点档。
+function parseClaimWindow(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s || s === "*") return [];
+  const hours = new Set();
+  for (const part of s.split(/[,，\s]+/)) {
+    const m = part.match(/^(\d{1,2})(?:-(\d{1,2}))?$/);
+    if (!m) continue;
+    let a = parseInt(m[1], 10);
+    let b = m[2] == null ? a : parseInt(m[2], 10);
+    if (a > 23 || b > 23) continue;
+    if (a > b) [a, b] = [b, a];
+    for (let h = a; h <= b; h++) hours.add(h);
+  }
+  if (!hours.size) return [19];
+  return [...hours].sort((x, y) => x - y);
+}
+function claimWindowHours() {
+  return parseClaimWindow(state?.claim_window);
+}
+function beijingHourAt(now = Date.now()) {
+  return new Date(now + 8 * 3600 * 1000).getUTCHours();
+}
+function inClaimWindow(now = Date.now()) {
+  const hours = claimWindowHours();
+  if (!hours.length) return true;
+  return hours.includes(beijingHourAt(now));
+}
+// 距下个窗口起点（北京时间整点）的毫秒数；已在窗口内返回 0。
+function msUntilNextWindowStart(now = Date.now()) {
+  const hours = claimWindowHours();
+  if (!hours.length) return 0;
+  const d = new Date(now + 8 * 3600 * 1000);
+  const frac = d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
+  if (hours.includes(Math.floor(frac))) return 0;
+  for (const h of hours) {
+    if (frac < h) return Math.round((h - frac) * 3600 * 1000);
+  }
+  return Math.round((24 - frac + hours[0]) * 3600 * 1000);
+}
+function nextWindowLabel() {
+  const wait = msUntilNextWindowStart();
+  if (!wait) return "";
+  return new Date(Date.now() + wait).toLocaleTimeString(localeTag(), { hour12: false });
+}
+// 自动领取总调度：窗口内跑轮 + 60s 节拍；窗口外零探测，仅准点唤醒/回看设置。
+function scheduleAutoClaim(delayMs) {
+  if (autoClaimTimer) clearTimeout(autoClaimTimer);
+  autoClaimTimer = setTimeout(autoClaimGate, Math.max(1000, delayMs));
+}
+function autoClaimGate() {
+  autoClaimTimer = null;
+  if (!state?.auto_claim || autoClaimRunning) return;
+  const now = Date.now();
+  if (inClaimWindow(now)) {
+    Promise.resolve(autoClaimTick())
+      .catch(() => {})
+      .finally(() => {
+        if (state?.auto_claim) scheduleAutoClaim(AUTO_CLAIM_WINDOW_BEAT_MS);
+      });
+  } else {
+    scheduleAutoClaim(Math.min(msUntilNextWindowStart(now), AUTO_CLAIM_IDLE_LOOK_MS));
+  }
+}
+
 function autoPillTitle(s) {
   const bits = [t("btn.autoClaimTitle")];
+  if (s.auto_claim) {
+    bits.push(inClaimWindow()
+      ? t("m.autoClaimWindowActive")
+      : t("m.autoClaimWindowIdle", { time: nextWindowLabel() }));
+  }
   if (autoClaimRunning) bits.push(t(s.auto_claim ? "m.autoClaimRound" : "m.autoClaimStopping"));
   if (lastAutoRound) {
     const d = new Date(lastAutoRound.at);
@@ -394,7 +472,7 @@ const actions = {
         claimable[id] = { plans: claimable[id]?.plans || [], busy: true };
         if (!uiLocked()) render();
         try {
-          const r = await invoke("claim_refresh", { id });
+          const r = await invoke("claim_refresh", { id, force: true });
           claimable[id] = { plans: r.plans || [], err: null, busy: false };
           if ((r.plans || []).length) okCount++;
           if (r.activationError) toast(t("m.refreshClaimAcctErr", { name, err: stripErr(r.activationError) }), "warn");
@@ -429,7 +507,7 @@ const actions = {
       render();
       if (state.auto_claim) {
         toast(t("m.autoClaimOn"), "ok", t("m.autoClaimOnDetail"));
-        if (Date.now() - (lastAutoRound?.at ?? 0) > REFRESH_CLAIM_COOLDOWN_MS) autoClaimTick();
+        if (Date.now() - (lastAutoRound?.at ?? 0) > REFRESH_CLAIM_COOLDOWN_MS) scheduleAutoClaim(0);
       } else {
         lastAutoRound = null;
       }
@@ -513,6 +591,11 @@ async function autoClaimTick() {
           break;
         }
         if (r.ok === false) {
+          if (r.code === 1003) {
+            // 「已经领取过」= 幂等成功：上游投放会重复列出同一套餐，静默跳过
+            // 不冷却不报错（zcode2api 同口径），下轮 preview 自然不再列出
+            break;
+          }
           autoClaimCooldown[id] = autoClaimCooldownFor(r);
           break;
         }
@@ -883,11 +966,15 @@ listen("claim://result", (ev) => {
   const p = ev.payload || {};
   if (claimWaiter && claimWaiter.accountId === p.accountId) claimWaiter.finish(p);
   if (p.ok === false) {
-    let msg = p.message || t("m.unknownErr");
-    if (p.code === 1005 && p.nextAt) {
-      msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+    // 自动轮次里「已领取过」（1003）= 幂等成功，静默不 toast；手动领取仍提示
+    const silent1003 = p.code === 1003 && autoClaimRunning;
+    if (!silent1003) {
+      let msg = p.message || t("m.unknownErr");
+      if (p.code === 1005 && p.nextAt) {
+        msg += t("m.claimNextAt", { time: new Date(p.nextAt).toLocaleString(localeTag(), { hour12: false }) });
+      }
+      toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
     }
-    toast(t("m.claimFailed", { name: p.accountName, msg }), "err");
   } else {
     const bits = [];
     const now = p.serverTime || Date.now();
@@ -984,8 +1071,7 @@ async function sweepTick() {
       invoke("get_state").then((s) => { state = s; if (s?.language) init(s.language); enrollAccounts(); if (!uiLocked()) render(); }).catch(() => {});
     }, 5000);
     setInterval(sweepTick, TICK_MS);
-    setTimeout(autoClaimTick, AUTO_CLAIM_FIRST_DELAY_MS);
-    setInterval(autoClaimTick, AUTO_CLAIM_INTERVAL_MS);
+    scheduleAutoClaim(AUTO_CLAIM_FIRST_DELAY_MS);
   } catch (e) {
     $app.innerHTML = `<div class="loading" style="color:var(--red)">${t("common.loadFail", { e: esc(stripErr(e)) })}</div>`;
     invoke("reveal_main").catch(() => {});

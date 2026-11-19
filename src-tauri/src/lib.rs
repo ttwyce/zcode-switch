@@ -230,13 +230,16 @@ struct ClaimRefreshResult {
 }
 
 #[tauri::command]
-async fn claim_refresh(id: String) -> Result<ClaimRefreshResult, String> {
+async fn claim_refresh(id: String, force: Option<bool>) -> Result<ClaimRefreshResult, String> {
     let paths = Paths::detect();
     let mid = store::ensure_virtual_device_mid(&paths, &id)?;
     let acc = load_account(&paths, &id)?;
+    // force=true 仅手动「刷新领取资格」传入：激活上报必发；自动轮次缺省 false，
+    // 激活上报按号每日去重（官方 app_daily_active 节奏，见 claim.rs 去重门注释）。
     let (activated, activation_error) =
         match claim::telemetry_user_id(&paths.home, &acc.credentials) {
-            Some(uid) => match claim::report_activation_events(&uid, &mid) {
+            Some(uid) => match claim::report_activation_events(&uid, &mid, force.unwrap_or(false))
+            {
                 Ok(()) => (true, None),
                 Err(e) => (false, Some(e)),
             },
@@ -845,6 +848,7 @@ async fn set_behavior(
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
+    claim_window: Option<String>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -860,6 +864,9 @@ async fn set_behavior(
     }
     if let Some(v) = auto_claim {
         s.auto_claim = Some(v);
+    }
+    if let Some(v) = claim_window {
+        s.claim_window = Some(v.trim().to_string());
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
