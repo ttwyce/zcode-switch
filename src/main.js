@@ -27,6 +27,13 @@ const AUTO_ABORT_WAIT_MS = 90_000;
 // （防风控），只安排到下个窗口起点的准点唤醒 + 低频回看设置改动。
 const AUTO_CLAIM_WINDOW_BEAT_MS = 60 * 1000;
 const AUTO_CLAIM_IDLE_LOOK_MS = 30 * 60 * 1000;
+// 19 点预热提前量：窗口开始前 90s 先跑一轮 claim_refresh（激活事件在 Rust 侧
+// 已按号每日去重，预热把它提前打掉 + preview 落袋），19:00:00 准点唤醒后
+// claim_start 直奔主题，省掉开闸后第一跳的激活往返。
+const AUTO_CLAIM_PREHEAT_LEAD_MS = 90 * 1000;
+// 人工验证冷却：1h 太粗——19 点窗口总共 1 小时，1h 冷却 = 当晚直接放弃。
+// 15 分钟给当晚留 3 次翻身机会。
+const AUTO_CLAIM_INTERACTIVE_COOL_MS = 15 * 60 * 1000;
 let autoClaimRunning = false;
 let autoClaimCooldown = {};
 let autoAbortRequested = false;
@@ -192,7 +199,36 @@ function autoClaimGate() {
         if (state?.auto_claim) scheduleAutoClaim(AUTO_CLAIM_WINDOW_BEAT_MS);
       });
   } else {
-    scheduleAutoClaim(Math.min(msUntilNextWindowStart(now), AUTO_CLAIM_IDLE_LOOK_MS));
+    const wait = msUntilNextWindowStart(now);
+    if (wait <= AUTO_CLAIM_PREHEAT_LEAD_MS) {
+      // 预热：窗口前 90s 先激活 + preview 落袋（激活 Rust 侧每日去重，
+      // 19:00 准点唤醒后 claim_start 免等激活往返）
+      Promise.resolve(autoClaimPreheat())
+        .catch(() => {})
+        .finally(() => {
+          if (state?.auto_claim) scheduleAutoClaim(Math.max(msUntilNextWindowStart(), 1000));
+        });
+    } else {
+      // 窗口外零探测；唤醒点不越过预热提前量，保证预热分支可达
+      const idle = Math.max(wait - AUTO_CLAIM_PREHEAT_LEAD_MS, 1000);
+      scheduleAutoClaim(Math.min(idle, AUTO_CLAIM_IDLE_LOOK_MS));
+    }
+  }
+}
+
+async function autoClaimPreheat() {
+  if (!state?.auto_claim || autoClaimRunning) return;
+  const ids = (state?.accounts || []).map((a) => a.id);
+  for (const id of ids) {
+    if (!state?.auto_claim || inClaimWindow()) return; // 已进窗口则交给正式轮次
+    try {
+      const r = await invoke("claim_refresh", { id });
+      claimable[id] = { plans: r.plans || [], err: null, busy: false };
+    } catch (e) {
+      claimable[id] = { ...(claimable[id] || {}), err: String(e), busy: false };
+    }
+    if (!uiLocked()) render();
+    await new Promise((res) => setTimeout(res, 1200));
   }
 }
 
@@ -534,7 +570,7 @@ function autoClaimCooldownFor(r) {
   const now = Date.now();
   if (r.code === 1005 && r.nextAt) return r.nextAt;
   if (Number.isFinite(r.code) && r.code >= 1000) return now + 60 * 60 * 1000;
-  if (r.code === "interactive") return now + 60 * 60 * 1000;
+  if (r.code === "interactive") return now + AUTO_CLAIM_INTERACTIVE_COOL_MS;
   return now + AUTO_CLAIM_INTERVAL_MS;
 }
 
@@ -995,7 +1031,7 @@ listen("captcha://interactive", () => {
   if (!autoClaimRunning || !claimWaiter) return;
   const id = claimWaiter.accountId;
   invoke("claim_cancel").catch(() => {});
-  autoClaimCooldown[id] = Date.now() + 60 * 60 * 1000;
+  autoClaimCooldown[id] = Date.now() + AUTO_CLAIM_INTERACTIVE_COOL_MS;
   toast(t("m.autoClaimInteractive", { name: accountName(id) }), "warn", t("m.autoClaimInteractiveDetail"));
   claimWaiter.finish({ ok: false, code: "interactive" });
 });

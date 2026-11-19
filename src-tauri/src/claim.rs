@@ -128,10 +128,17 @@ fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
-        .build()
+    // 静态复用：ureq Agent 内部按 host 池化连接，preview/claim/marketing/config
+    // 共享 TLS 会话——每晚 19:00 抢量场景省掉每请求的 TCP+TLS 握手（数百毫秒）。
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(10))
+                .timeout(Duration::from_secs(CLAIM_TIMEOUT_SECS))
+                .build()
+        })
+        .clone()
 }
 
 pub const EVENT_REPORT_URL: &str = "https://zcode.z.ai/api/v1/event/report";
@@ -273,10 +280,12 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
+    let tag = crate::claimlog::mid_tag(device_mid.as_deref());
     let mut out = preview_once(&url, &token, device_mid.clone())?;
     // 合并 marketing/touch 活动投放通道（官方客户端实证：活动套餐由此下发，
     // 不进 billing/preview）。失败只跳过合并，不让整个 preview 报错。
     let marketing = fetch_marketing_touch_plans(&token, device_mid);
+    crate::claimlog::log(&tag, "preview", &format!("billing={} marketing={}", out.len(), marketing.len()));
     if !marketing.is_empty() {
         // 用 owned String 建去重集：借 out 的 &str 再 push 会撞借用检查
         let seen: std::collections::HashSet<String> =
@@ -292,6 +301,7 @@ pub fn preview_plans(
 }
 
 fn fetch_marketing_touch_plans(token: &str, mid: Option<String>) -> Vec<ClaimPlan> {
+    let tag = crate::claimlog::mid_tag(mid.as_deref());
     let mut req = agent().get(&format!("{MARKETING_TOUCH_URL}?seq=0"));
     for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
         req = req.set(&k, &v);
@@ -299,19 +309,20 @@ fn fetch_marketing_touch_plans(token: &str, mid: Option<String>) -> Vec<ClaimPla
     let resp = match req.call() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[claim] marketing/touch 查询跳过: {}", http_err("", e).trim());
+            crate::claimlog::log(&tag, "marketing-skip", &http_err("", e).trim());
             return Vec::new();
         }
     };
     let body = match resp.into_string() {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[claim] marketing/touch 响应读取失败: {e}");
+            crate::claimlog::log(&tag, "marketing-read-fail", &e.to_string());
             return Vec::new();
         }
     };
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        crate::claimlog::log(&tag, "marketing-skip", &format!("code={}", v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1)));
         return Vec::new();
     }
     let deliveries = v
@@ -319,7 +330,12 @@ fn fetch_marketing_touch_plans(token: &str, mid: Option<String>) -> Vec<ClaimPla
         .and_then(|d| d.as_array())
         .cloned()
         .unwrap_or_default();
-    extract_plans_from_deliveries(&deliveries)
+    let plans = extract_plans_from_deliveries(&deliveries);
+    if !plans.is_empty() {
+        let ids: Vec<&str> = plans.iter().map(|p| p.plan_id.as_str()).collect();
+        crate::claimlog::log(&tag, "marketing-plans", &ids.join(","));
+    }
+    plans
 }
 
 /// 从 marketing/touch 的 deliveries 载荷递归提取待领取套餐。
@@ -457,10 +473,18 @@ pub fn submit_claim(
             next_at: None,
         })?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
+    let tag = crate::claimlog::mid_tag(device_mid.as_deref());
     let code = v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(claim_error(code, &v));
+        let err = claim_error(code, &v);
+        crate::claimlog::log(
+            &tag,
+            "claim-fail",
+            &format!("plan={plan_id} code={} {}", err.code, err.message),
+        );
+        return Err(err);
     }
+    crate::claimlog::log(&tag, "claim-ok", &format!("plan={plan_id}"));
     Ok(v)
 }
 
@@ -486,6 +510,7 @@ pub fn fetch_captcha_config() -> Result<CaptchaConfig, String> {
     // 签发端点一致，错位 = 上游验签必败 3007。
     if region.eq_ignore_ascii_case("sgp") {
         region = "cn".to_string();
+        crate::claimlog::log("", "captcha-region", "sgp normalized to cn");
     }
     Ok(CaptchaConfig {
         enabled: c.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),

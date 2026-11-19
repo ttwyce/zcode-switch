@@ -2,6 +2,7 @@ pub mod cipher;
 pub mod cli;
 pub mod i18n;
 mod claim;
+mod claimlog;
 mod flowlog;
 mod oauth;
 mod probe;
@@ -1215,6 +1216,7 @@ pub fn run() {
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
+                claimlog::init(&data_dir);
             }
             let _tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().expect("no window icon").clone())
