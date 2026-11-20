@@ -194,6 +194,8 @@ fn classify_via(channels: &[Channel], fetch: &ProbeFetch) -> Option<ProbeOutcome
                 let url = format!("{}?app_version={}", quota::BILLING_BALANCE_URL, quota::zcode_app_version());
                 billing_verdict(fetch(&url, tok))
             }
+            // Coding 平面第二账本：只作额度补盲，不参与账号有效性判定
+            Channel::ZaiCoding(_) => Verdict::Inconclusive,
         };
         match verdict {
             Verdict::Entitled(n, ms) => {
